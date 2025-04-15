@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+import os
+import validators  # Library for validating URLs
+import requests  # Library for making HTTP requests
+from nicegui import ui, app  # NiceGUI framework components
+from time import time  # For getting current timestamps
+from pydantic import BaseModel  # For data validation and parsing
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# --- Global Variables ---
+# NOTE: Extensive use of global variables can make code harder to manage
+#       in larger applications. Consider alternative state management if complexity grows.
+
+# Stores the timestamp associated with the last received stack data.
+# Used to check if new data has arrived.
+global stack_time
+# Stores the actual stack data (likely a string representation) received via the /push endpoint.
+global stack
+# Stores associated trace information received via the /push endpoint.
+global trace
+# Stores the timestamp of the data currently displayed in the UI.
+# Compared against stack_time to trigger UI refreshes.
+global shown_time
+# Stores the base URL of this running NiceGUI application.
+# Needs to be accessible by the 'server' for potential callbacks or identification.
+global local_url
+# Stores the base URL of the remote server component that this app interacts with (e.g., sends binding info).
+global server_url
+
+# Initialize global variables
+stack_time = time()  # Initialize with current time
+shown_time = 0       # Initialize to 0 to ensure the first poll triggers a display
+stack = None         # No stack data initially
+trace = None         # No trace data initially
+local_url = os.environ.get("LOCAL", None)  # Try to get local URL from environment variable 'LOCAL'
+server_url = os.environ.get("SERVER", None) # Try to get server URL from environment variable 'SERVER'
+
+# --- Data Model ---
+
+class Payload(BaseModel):
+    """
+    Defines the expected structure and types for data received on the /push endpoint.
+    Uses Pydantic for automatic validation.
+    """
+    timestamp: int  # Unix timestamp indicating when the data was generated/sent.
+    data: str       # The main content, likely the stack trace itself.
+    trace: str      # Additional trace information.
+
+# --- API Endpoint ---
+
+@app.post("/push")
+def push(payload: Payload):
+    """
+    FastAPI POST endpoint integrated with NiceGUI to receive stack data.
+
+    This endpoint is called by an external process (presumably the one being debugged
+    or monitored) to send stack and trace information to this application.
+
+    Args:
+        payload (Payload): The incoming data, automatically validated against the Payload model.
+
+    Returns:
+        Union[int, str]: The timestamp of the received payload on success,
+                         or an error message string on failure.
+    """
+    print("Push Received") # Log receipt for debugging
+    print(payload) # Log the received payload for debugging
+
+    # Basic validation for payload existence and required fields
+    if payload is None or payload.timestamp is None or payload.data is None:
+        return "Err: Malformed payload" # Return error if data is incomplete
+
+    # Access global variables to update the application state
+    global stack_time
+    global stack
+    global trace
+
+    # Update global state with the received data
+    stack_time = payload.timestamp
+    stack = payload.data
+    trace = payload.trace
+
+    # Return the timestamp as confirmation
+    return stack_time
+
+# --- UI Components and Logic ---
+
+@ui.refreshable
+def show_stack():
+    """
+    A NiceGUI refreshable component that displays the stack and trace information.
+
+    This function's output can be updated dynamically using .refresh().
+    It checks the global 'stack' variable and displays its content,
+    along with the 'trace' if available. Shows "Waiting..." if no stack data exists yet.
+    """
+    global stack
+    global trace
+
+    if stack is not None:
+        ui.label("Stack:")
+        # Display the stack data in a code block, spanning the full width.
+        ui.code(stack).classes('w-full')
+        if trace is not None:
+            ui.label("Trace:")
+            # Display the trace data (if present) in a code block.
+            ui.code(trace).classes('w-full')
+    else:
+        # Display a waiting message if no stack data has been received yet.
+        ui.label("Waiting...")
+
+def poll_stack():
+    """
+    Periodically checks if new stack data has been received and refreshes the UI.
+
+    Compares the global 'stack_time' (timestamp of last received data) with
+    'shown_time' (timestamp of data last displayed). If they differ, it means
+    new data arrived via '/push', so it calls `show_stack.refresh()`.
+
+    Also checks if server_url and local_url are set. If not, it redirects
+    the user to the '/bind' page to configure them.
+
+    NOTE: The ui.timer call within this function is commented out. It's likely
+          intended to be called *by* a timer, not to start one itself recursively.
+          The timer is correctly started on the home page ('/').
+    """
+    global stack_time
+    global shown_time
+    global server_url
+    global local_url
+
+    # Ensure required URLs are configured. If not, force user to the bind page.
+    if server_url is None or local_url is None:
+        print("Redirecting to /bind because URLs are not set.") # Log redirection
+        return ui.navigate.to('/bind') # Use return to stop further execution in this call
+
+    # Check if the timestamp of the received data is different from the displayed data
+    if stack_time != shown_time:
+        print(f"New data detected (stack_time: {stack_time}, shown_time: {shown_time}). Refreshing UI.") # Log refresh
+        show_stack.refresh()  # Trigger an update of the 'show_stack' component
+        shown_time = stack_time  # Update the 'shown_time' to match the latest data
+    # The timer is typically started *outside* the function it calls.
+    # ui.timer(0.5, poll_stack, once=True) # This would create nested timers if uncommented.
+
+def try_bind(show_result: bool = False) -> bool:
+    """
+    Attempts to register this client application with the remote server.
+
+    Sends a POST request to the server's '/attach' endpoint, providing the
+    client's own 'local_url'.
+
+    Args:
+        show_result (bool): If True, displays the server's response in a dialog.
+
+    Returns:
+        bool: True if the server responds with the exact string "true", False otherwise.
+    """
+    global local_url
+    global server_url
+
+    # Ensure URLs are set before attempting to bind
+    if not local_url or not server_url:
+        print("Error: Cannot bind without local_url and server_url set.")
+        if show_result:
+             with ui.dialog() as dialog, ui.card():
+                ui.label("Binding Error")
+                ui.label("Local URL or Server URL is not set.")
+                dialog.open()
+        return False
+
+    try:
+        # Send POST request to the server's /attach endpoint
+        res = requests.post(f"{server_url}/attach", json={'host': local_url})
+        res.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+        print("BIND Response: ") # Log server response
+        print(res.text)
+
+        # Optionally display the raw response from the server in a popup dialog
+        if show_result:
+            with ui.dialog() as dialog, ui.card():
+                ui.label(f"Binding Attempt to {server_url}/attach")
+                ui.label(f"Sent local URL: {local_url}")
+                ui.separator()
+                ui.label("Server Response:")
+                # Use preformatted text for potentially multi-line or structured responses
+                ui.html(f"<pre>{res.text}</pre>")
+                dialog.open()
+
+        # Check if the server's response indicates successful binding
+        return res.text == "true"
+
+    except requests.exceptions.RequestException as e:
+        print(f"Error during binding: {e}")
+        # Show error in dialog if requested
+        if show_result:
+             with ui.dialog() as dialog, ui.card():
+                ui.label("Binding Error")
+                ui.label(f"Could not connect to server or received error:")
+                ui.html(f"<pre>{e}</pre>")
+                dialog.open()
+        return False
+
+def validate_url(value: str) -> str | None:
+    """
+    Validation function for URL input fields.
+
+    Uses the 'validators' library to check if the provided string is a valid URL.
+
+    Args:
+        value (str): The input string to validate.
+
+    Returns:
+        Optional[str]: None if the URL is valid, an error message string otherwise.
+    """
+    if not value: # Treat empty input as invalid for required fields
+        return "URL cannot be empty."
+    if validators.url(value):
+        return None  # Validation successful
+    else:
+        return "Invalid URL format." # Validation failed
+
+# --- UI Pages ---
+
+@ui.page("/bind")
+def bind():
+    """
+    NiceGUI page for configuring the local and server URLs.
+
+    Provides input fields for the user to enter the necessary URLs.
+    Includes a 'Bind' button that attempts to register with the server
+    using the entered URLs and navigates to the home page ('/') on success.
+    """
+    ui.label("Please enter server and local URL first").classes('text-lg font-semibold mb-4')
+
+    # Input field for the local URL of this application
+    inplocal = ui.input("This App's Base URL (e.g., http://192.168.1.1:8080)",
+                        placeholder="http://<local_ip>:<port>",
+                        validation=validate_url,
+                        value=local_url or '' # Pre-fill if already known
+                       ).classes('w-full')
+
+    # Input field for the remote server's base URL
+    inpserver = ui.input("Remote Server Base URL (e.g., http://192.168.1.2:8000/ddbg)",
+                         placeholder="http://<server_ip>:<port>/<path>",
+                         validation=validate_url,
+                         value=server_url or '' # Pre-fill if already known
+                        ).classes('w-full')
+
+    def on_bind_click():
+        """Callback function for the 'Bind' button."""
+        global local_url
+        global server_url
+
+        # Basic check if inputs have values before proceeding
+        # Rely on built-in validation for format check
+        if not inplocal.value or not inpserver.value:
+             ui.notify("Please enter both URLs.", type='warning')
+             return
+        # Explicitly trigger validation before using values
+        if inplocal.validate() is False or inpserver.validate() is False:
+             ui.notify("Please correct the invalid URL(s).", type='warning')
+             return
+
+
+        # Update global variables with the values from the input fields
+        local_url = inplocal.value
+        server_url = inpserver.value
+
+        ui.notify(f"Attempting to bind with server: {server_url} using local: {local_url}", type='info')
+
+        # Attempt to bind with the server and show the result in a dialog
+        if try_bind(show_result=True):
+            ui.notify("Binding successful!", type='positive')
+            ui.navigate.to("/") # Navigate to the main page on successful binding
+        else:
+            # Notification is already handled within try_bind if show_result=True
+            # but we add one here in case it's turned off later.
+            ui.notify("Binding failed. Check URLs and server status.", type='negative')
+
+
+    # Button to trigger the binding process
+    ui.button("Save and Bind", on_click=on_bind_click).classes('mt-4')
+
+@ui.page("/")
+def home():
+    """
+    The main landing page of the application.
+
+    Displays the stack trace area (using the 'show_stack' component)
+    and starts a timer that periodically calls 'poll_stack' to check for updates.
+    Redirects to '/bind' if URLs are not configured.
+    """
+    # First, check if URLs are configured. If not, redirect immediately.
+    if server_url is None or local_url is None:
+        print("Home page: URLs not set, redirecting to /bind.")
+        ui.navigate.to('/bind')
+        # Optionally add a message explaining the redirect
+        # ui.label("Configuration needed. Redirecting to setup page...")
+        return # Stop rendering the rest of the home page
+
+    # If URLs are set, display the main content
+    ui.label("Debugger Stack Display").classes('text-xl font-bold')
+    # Add the refreshable component to the page. It will initially show "Waiting...".
+    show_stack()
+    # Start a timer that calls poll_stack every 0.5 seconds repeatedly.
+    ui.timer(0.5, poll_stack, active=True) # Ensure timer is active
+
+
+# --- Application Initialization ---
+
+# Check environment variables *after* defining functions but *before* ui.run()
+# This allows setting URLs via environment, bypassing the /bind page on startup.
+print("Checking environment variables for URLs...")
+env_local_url = os.environ.get("LOCAL", None)
+env_server_url = os.environ.get("SERVER", None)
+
+initial_bind_needed = True
+
+if env_server_url and env_local_url:
+    print(f"Found LOCAL={env_local_url}, SERVER={env_server_url} in environment.")
+    # Validate the URLs from environment variables
+    if validate_url(env_server_url) is None and validate_url(env_local_url) is None:
+        server_url = env_server_url
+        local_url = env_local_url
+        print("URLs from environment are valid. Attempting initial bind...")
+        # Optionally, attempt to bind automatically on startup if URLs are from env vars
+        if try_bind(show_result=False): # Attempt bind without showing dialog initially
+             print("Initial bind successful.")
+             initial_bind_needed = False # No need to force /bind page
+        else:
+             print("Initial bind failed using environment variables.")
+             # Keep initial_bind_needed = True, will redirect from home page
+    else:
+        print("Error: Invalid URL format found in environment variables.")
+        # Clear potentially invalid globals if validation failed
+        server_url = None
+        local_url = None
+        # Raise an exception or log prominently? For now, just log and let redirect handle it.
+        # raise ValueError("Invalid URL format in environment variables LOCAL or SERVER.")
+else:
+    print("LOCAL and/or SERVER environment variables not set.")
+    # Ensure globals are None if not set via environment
+    server_url = None
+    local_url = None
+
+# Start the NiceGUI application server
+# host='0.0.0.0' makes it accessible on the network
+# title sets the browser tab title
+ui.run(host="0.0.0.0", title="DDBG Client") # Set reload=False for production/stability
